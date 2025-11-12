@@ -1,5 +1,5 @@
 import { useEffect, useState, useCallback } from 'react'
-import { getAllNotes, saveNote, deleteNote as deleteNoteLocal, updateNoteDirect, addVersion, getVersions, clearVersions } from '../utils/indexedDB'
+import { getAllNotesByUser, getAllNotes, saveNote, deleteNote as deleteNoteLocal, updateNoteDirect, addVersion, getVersions, clearVersions } from '../utils/indexedDB'
 import { pushNoteToFirebase, listenToUserNotes, fetchUserNotesOnce, deleteNoteFromFirebase } from '../utils/firebaseSync'
 
 /**
@@ -8,14 +8,16 @@ import { pushNoteToFirebase, listenToUserNotes, fetchUserNotesOnce, deleteNoteFr
 export default function useNotesSync(isOnline, userId) {
   const [notes, setNotes] = useState([])
 
-  // load from indexedDB on mount
+  // load local notes for the current user when userId changes
   useEffect(() => {
     let mounted = true
-    getAllNotes().then((saved) => {
+    ;(async () => {
+      if (!userId) { if (mounted) setNotes([]); return }
+      const saved = await getAllNotesByUser(userId)
       if (mounted) setNotes((saved || []).sort((a,b)=> b.lastUpdated - a.lastUpdated))
-    })
+    })()
     return () => { mounted = false }
-  }, [])
+  }, [userId])
 
   // when online and authenticated, listen + perform upward sync
   useEffect(() => {
@@ -26,17 +28,17 @@ export default function useNotesSync(isOnline, userId) {
       if (cancelled) return
       const cloudMap = cloudNotesObj || {}
       const cloudNotes = Object.values(cloudMap)
-      const localList = await getAllNotes()
+      const localList = await getAllNotesByUser(userId)
 
-      // Add / update newer from cloud
+      // Add / update newer from cloud (tag with userId)
       for (const cn of cloudNotes) {
         const found = localList.find(n => n.id === cn.id)
         if (!found || (cn.lastUpdated > (found.lastUpdated || 0))) {
-          await saveNote(cn)
+          await saveNote({ ...cn, userId }, userId)
         }
       }
 
-      // Remove locally any note that no longer exists in cloud
+      // Remove locally any note (of this user) that no longer exists in cloud
       const cloudIds = new Set(Object.keys(cloudMap))
       for (const ln of localList) {
         if (!cloudIds.has(ln.id)) {
@@ -45,14 +47,14 @@ export default function useNotesSync(isOnline, userId) {
         }
       }
 
-      const refreshed = await getAllNotes()
+      const refreshed = await getAllNotesByUser(userId)
       setNotes((refreshed || []).sort((a,b)=> b.lastUpdated - a.lastUpdated))
     })
 
-    // Upward sync (local -> cloud)
+    // Upward sync (local -> cloud) for this user only
     ;(async () => {
       const [localList, cloudMap] = await Promise.all([
-        getAllNotes(),
+        getAllNotesByUser(userId),
         fetchUserNotesOnce(userId)
       ])
       for (const ln of localList) {
@@ -65,7 +67,7 @@ export default function useNotesSync(isOnline, userId) {
           }
         }
       }
-      const refreshed = await getAllNotes()
+      const refreshed = await getAllNotesByUser(userId)
       setNotes((refreshed || []).sort((a,b)=> b.lastUpdated - a.lastUpdated))
     })()
 
@@ -73,8 +75,9 @@ export default function useNotesSync(isOnline, userId) {
   }, [isOnline, userId])
 
   const createOrUpdateNote = useCallback(async (note) => {
-    // detect previous version
-    const existing = (await getAllNotes()).find(n => n.id === note.id)
+    if (!userId) return
+    // detect previous version in this user's space
+    const existing = (await getAllNotesByUser(userId)).find(n => n.id === note.id)
     if (existing) {
       if (
         existing.title !== note.title ||
@@ -84,41 +87,41 @@ export default function useNotesSync(isOnline, userId) {
         await addVersion(existing)
       }
     }
-    // save locally
-    await saveNote(note)
-    const refreshed = await getAllNotes()
+    // save locally with userId
+    await saveNote({ ...note, userId }, userId)
+    const refreshed = await getAllNotesByUser(userId)
     setNotes((refreshed || []).sort((a,b)=> b.lastUpdated - a.lastUpdated))
     if (isOnline && userId) {
-      await pushNoteToFirebase(userId, note)
+      await pushNoteToFirebase(userId, { ...note, userId })
       // mark synced
-      note.lastSynced = note.lastUpdated
-      await updateNoteDirect(note)
+      const updated = { ...note, userId, lastSynced: note.lastUpdated }
+      await updateNoteDirect(updated)
     }
   }, [isOnline, userId])
 
   const removeNote = useCallback(async (id) => {
-    // delete local
     await deleteNoteLocal(id)
     await clearVersions(id)
-    // delete remote if possible
     if (isOnline && userId) {
       await deleteNoteFromFirebase(userId, id)
     }
-    const refreshed = await getAllNotes()
+    const refreshed = userId ? await getAllNotesByUser(userId) : []
     setNotes((refreshed || []).sort((a,b)=> b.lastUpdated - a.lastUpdated))
   }, [isOnline, userId])
 
   // expose restore
   const restoreNoteVersion = useCallback(async (version) => {
+    if (!userId) return
     const restored = {
       id: version.noteId,
       title: version.title,
       content: version.content,
       language: version.language,
       lastUpdated: Date.now(),
+      userId,
     }
-    await saveNote(restored)
-    const refreshed = await getAllNotes()
+    await saveNote(restored, userId)
+    const refreshed = await getAllNotesByUser(userId)
     setNotes((refreshed || []).sort((a,b)=> b.lastUpdated - a.lastUpdated))
     if (isOnline && userId) {
       await pushNoteToFirebase(userId, restored)
