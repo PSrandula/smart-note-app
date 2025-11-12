@@ -4,28 +4,54 @@ const DB_NAME = 'notes-db'
 const STORE = 'notes'
 const VERS_STORE = 'note_versions'
 
-export const dbPromise = openDB(DB_NAME, 2, {
+export const dbPromise = openDB(DB_NAME, 3, {
   upgrade(db, oldVersion) {
     if (!db.objectStoreNames.contains(STORE)) {
-      db.createObjectStore(STORE, { keyPath: 'id' })
+      const store = db.createObjectStore(STORE, { keyPath: 'id' })
+      // add index when initially creating too
+      store.createIndex?.('by_user', 'userId')
     }
     if (oldVersion < 2 && !db.objectStoreNames.contains(VERS_STORE)) {
       const store = db.createObjectStore(VERS_STORE, { keyPath: 'id' })
       store.createIndex('by_note', 'noteId')
       store.createIndex('by_note_time', ['noteId', 'savedAt'])
     }
+    // add user index on notes if upgrading to v3
+    if (oldVersion < 3) {
+      try {
+        db.transaction(STORE, 'versionchange').objectStore(STORE).createIndex('by_user', 'userId')
+      } catch {
+        // index may already exist if created above
+      }
+    }
   },
 })
 
-export async function saveNote(note) {
+export async function saveNote(note, userId) {
   const db = await dbPromise
-  if (!note.lastUpdated) note.lastUpdated = Date.now() // only set if absent
+  // attach userId safely
+  note.userId = userId ?? note.userId ?? null
+  if (!note.lastUpdated) note.lastUpdated = Date.now()
   await db.put(STORE, note)
 }
 
 export async function getAllNotes() {
   const db = await dbPromise
   return await db.getAll(STORE)
+}
+
+// fetch only notes belonging to a specific user
+export async function getAllNotesByUser(userId) {
+  const db = await dbPromise
+  if (!userId) return []
+  try {
+    const idx = db.transaction(STORE).store.index('by_user')
+    return await idx.getAll(userId)
+  } catch {
+    // fallback if index missing
+    const all = await db.getAll(STORE)
+    return all.filter(n => n.userId === userId)
+  }
 }
 
 export async function getNoteById(id) {
